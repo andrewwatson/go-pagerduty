@@ -14,6 +14,7 @@ type Team struct {
 	Name        string     `json:"name,omitempty"`
 	Description string     `json:"description,omitempty"`
 	Parent      *APIObject `json:"parent,omitempty"`
+	DefaultRole string     `json:"default_role,omitempty"`
 }
 
 // ListTeamResponse is the structure used when calling the ListTeams API endpoint.
@@ -62,7 +63,7 @@ func (c *Client) ListTeamsWithContext(ctx context.Context, o ListTeamOptions) (*
 		return nil, err
 	}
 
-	resp, err := c.get(ctx, "/teams?"+v.Encode())
+	resp, err := c.get(ctx, "/teams?"+v.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +111,7 @@ func (c *Client) GetTeam(id string) (*Team, error) {
 
 // GetTeamWithContext gets details about an existing team.
 func (c *Client) GetTeamWithContext(ctx context.Context, id string) (*Team, error) {
-	resp, err := c.get(ctx, "/teams/"+id)
+	resp, err := c.get(ctx, "/teams/"+id, nil)
 	return getTeamFromResponse(c, resp, err)
 }
 
@@ -297,7 +298,7 @@ func (c *Client) ListTeamMembers(ctx context.Context, teamID string, o ListTeamM
 		return nil, err
 	}
 
-	resp, err := c.get(ctx, "/teams/"+teamID+"/members?"+v.Encode())
+	resp, err := c.get(ctx, "/teams/"+teamID+"/members?"+v.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}

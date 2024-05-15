@@ -13,17 +13,17 @@ import (
 	"github.com/mitchellh/cli"
 )
 
-type EventOrchestrationUpdate struct {
+type StandardUpdate struct {
 	Meta
 }
 
-func EventOrchestrationUpdateCommand() (cli.Command, error) {
-	return &EventOrchestrationUpdate{}, nil
+func StandardUpdateCommand() (cli.Command, error) {
+	return &StandardUpdate{}, nil
 }
 
-func (c *EventOrchestrationUpdate) Help() string {
+func (c *StandardUpdate) Help() string {
 	helpText := `
-	pd event-orchestration update <FILE> Update an event orchestration from json file
+	pd standard update <FILE> Update an standard from json file
 	Options:
 
 		 -id
@@ -32,15 +32,16 @@ func (c *EventOrchestrationUpdate) Help() string {
 	return strings.TrimSpace(helpText)
 }
 
-func (c *EventOrchestrationUpdate) Synopsis() string {
-	return "Update an existing event orchestration"
+func (c *StandardUpdate) Synopsis() string {
+	return "Update an existing standard"
 }
 
-func (c *EventOrchestrationUpdate) Run(args []string) int {
-	var eoID string
-	flags := c.Meta.FlagSet("event-orchestration update")
+func (c *StandardUpdate) Run(args []string) int {
+	var standardID string
+
+	flags := c.Meta.FlagSet("standard update")
 	flags.Usage = func() { fmt.Println(c.Help()) }
-	flags.StringVar(&eoID, "id", "", "Event orchestration id")
+	flags.StringVar(&standardID, "id", "", "standard id")
 	if err := flags.Parse(args); err != nil {
 		log.Error(err)
 		return -1
@@ -49,13 +50,13 @@ func (c *EventOrchestrationUpdate) Run(args []string) int {
 		log.Error(err)
 		return -1
 	}
-	if eoID == "" {
-		log.Error("You must provide event orchestration id")
+	if standardID == "" {
+		log.Error("You must provide standard id")
 		return -1
 	}
 
 	client := c.Meta.Client()
-	var eo pagerduty.Orchestration
+	var standard pagerduty.Standard
 	if len(flags.Args()) != 1 {
 		log.Error("Please specify input json file")
 		return -1
@@ -68,13 +69,13 @@ func (c *EventOrchestrationUpdate) Run(args []string) int {
 		return -1
 	}
 
-	if err := json.Unmarshal(f, &eo); err != nil {
+	if err := json.Unmarshal(f, &standard); err != nil {
 		log.Errorln("Failed to decode json. Error:", err)
 		return -1
 	}
 
-	log.Debugf("%#v", eo)
-	if _, err := client.UpdateOrchestrationWithContext(context.Background(), eoID, eo); err != nil {
+	log.Debugf("%#v", standard)
+	if _, err := client.UpdateStandard(context.Background(), standardID, standard); err != nil {
 		log.Error(err)
 		return -1
 	}

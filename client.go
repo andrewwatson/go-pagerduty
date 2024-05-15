@@ -14,21 +14,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
 	"path"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 // Version is current version of this client.
-const Version = "1.8.0-alpha"
+const Version = "1.9.0-alpha"
 
 const (
 	apiEndpoint         = "https://api.pagerduty.com"
+	identityEndpoint    = "https://identity.pagerduty.com"
 	v2EventsAPIEndpoint = "https://events.pagerduty.com"
 )
 
@@ -41,6 +46,8 @@ const (
 
 	// OAuth token authentication
 	oauthToken
+
+	scopedOAuthAppToken
 )
 
 // APIObject represents generic api json response that is shared by most
@@ -83,14 +90,37 @@ type APIErrorObject struct {
 	Errors  []string `json:"errors,omitempty"`
 }
 
-// fallbackAPIErrorObject is a shim to solve this issue:
-// https://github.com/PagerDuty/go-pagerduty/issues/339
-//
-// TODO: remove when PagerDuty engineering confirms bugfix to the REST API
-type fallbackAPIErrorObject struct {
-	Code    int    `json:"code,omitempty"`
-	Message string `json:"message,omitempty"`
-	Errors  string `json:"errors,omitempty"`
+func unmarshalApiErrorObject(data []byte) (APIErrorObject, error) {
+	var aeo APIErrorObject
+	err := json.Unmarshal(data, &aeo)
+	if err == nil {
+		return aeo, nil
+	}
+	if _, ok := err.(*json.UnmarshalTypeError); !ok {
+		return aeo, nil
+	}
+	// See - https://github.com/PagerDuty/go-pagerduty/issues/339
+	// TODO: remove when PagerDuty engineering confirms bugfix to the REST API
+	var fallback1 struct {
+		Code    int    `json:"code,omitempty"`
+		Message string `json:"message,omitempty"`
+		Errors  string `json:"errors,omitempty"`
+	}
+	if json.Unmarshal(data, &fallback1) == nil {
+		aeo.Code = fallback1.Code
+		aeo.Message = fallback1.Message
+		aeo.Errors = []string{fallback1.Errors}
+		return aeo, nil
+	}
+	// See - https://github.com/PagerDuty/go-pagerduty/issues/478
+	var fallback2 []string
+	if json.Unmarshal(data, &fallback2) == nil {
+		aeo.Message = "none"
+		aeo.Errors = fallback2
+		return aeo, nil
+	}
+	// still failed, so return the original error
+	return aeo, err
 }
 
 // NullAPIErrorObject is a wrapper around the APIErrorObject type. If the Valid
@@ -111,28 +141,9 @@ var _ json.Unmarshaler = (*NullAPIErrorObject)(nil) // assert that it satisfies 
 
 // UnmarshalJSON satisfies encoding/json.Unmarshaler
 func (n *NullAPIErrorObject) UnmarshalJSON(data []byte) error {
-	var aeo APIErrorObject
-
-	err := json.Unmarshal(data, &aeo)
+	aeo, err := unmarshalApiErrorObject(data)
 	if err != nil {
-		terr, ok := err.(*json.UnmarshalTypeError)
-		if !ok {
-			return err
-		}
-
-		//
-		// see https://github.com/PagerDuty/go-pagerduty/issues/339
-		//
-		var faeo fallbackAPIErrorObject
-
-		if err := json.Unmarshal(data, &faeo); err != nil {
-			// still failed, so return the original error
-			return terr
-		}
-
-		aeo.Code = faeo.Code
-		aeo.Message = faeo.Message
-		aeo.Errors = []string{faeo.Errors}
+		return err
 	}
 
 	n.ErrorObject = aeo
@@ -264,6 +275,16 @@ type HTTPClient interface {
 // Keep this unexported so consumers of the package can't make changes to it.
 var defaultHTTPClient HTTPClient = newDefaultHTTPClient()
 
+type retryPolicy struct {
+	MaxDelay   time.Duration
+	MaxRetries int
+}
+
+var defaultRetryPolicy = retryPolicy{
+	MaxDelay:   20 * time.Second,
+	MaxRetries: 0,
+}
+
 // Client wraps http client
 type Client struct {
 	debugFlag    *uint64
@@ -274,13 +295,18 @@ type Client struct {
 	apiEndpoint         string
 	v2EventsAPIEndpoint string
 
+	tokenSource oauth2.TokenSource
+
 	// Authentication type to use for API
 	authType authType
 
 	// HTTPClient is the HTTP client used for making requests against the
 	// PagerDuty API. You can use either *http.Client here, or your own
 	// implementation.
-	HTTPClient HTTPClient
+	HTTPClient  HTTPClient
+	retryPolicy retryPolicy
+
+	userAgent string
 }
 
 // NewClient creates an API client using an account/user API token
@@ -294,6 +320,7 @@ func NewClient(authToken string, options ...ClientOptions) *Client {
 		v2EventsAPIEndpoint: v2EventsAPIEndpoint,
 		authType:            apiToken,
 		HTTPClient:          defaultHTTPClient,
+		retryPolicy:         defaultRetryPolicy,
 	}
 
 	for _, opt := range options {
@@ -318,6 +345,25 @@ func WithAPIEndpoint(endpoint string) ClientOptions {
 	}
 }
 
+// WithRetryPolicy configures the client with a retry policy. Configuring a
+// retry policy on the client is currently experimental and should be used with care.
+func WithRetryPolicy(maxRetryAttempts int, maxDelaySeconds int) ClientOptions {
+	return func(c *Client) {
+		c.retryPolicy = retryPolicy{
+			MaxDelay:   time.Duration(maxDelaySeconds) * time.Second,
+			MaxRetries: maxRetryAttempts,
+		}
+	}
+}
+
+// WithTerraformProvider configures the client to be used as the PagerDuty
+// Terraform provider
+func WithTerraformProvider(version string) ClientOptions {
+	return func(c *Client) {
+		c.userAgent = fmt.Sprintf("(%s %s) Terraform/%s", runtime.GOOS, runtime.GOARCH, version)
+	}
+}
+
 // WithV2EventsAPIEndpoint allows for a custom V2 Events API endpoint to be passed into the client
 func WithV2EventsAPIEndpoint(endpoint string) ClientOptions {
 	return func(c *Client) {
@@ -330,6 +376,34 @@ func WithOAuth() ClientOptions {
 	return func(c *Client) {
 		c.authType = oauthToken
 	}
+}
+
+func WithScopedOAuthApp(ctx context.Context, clientId string, clientSecret string, scopes []string) ClientOptions {
+	ts := baseTokenSource(ctx, clientId, clientSecret, scopes)
+
+	return func(c *Client) {
+		c.authType = scopedOAuthAppToken
+		c.tokenSource = ts
+	}
+}
+
+func WithScopedOAuthAppTokenSource(tokenSource oauth2.TokenSource) ClientOptions {
+	return func(c *Client) {
+		c.authType = scopedOAuthAppToken
+		c.tokenSource = tokenSource
+	}
+}
+
+func baseTokenSource(context context.Context, clientId string, clientSecret string, scopes []string) oauth2.TokenSource {
+	config := clientcredentials.Config{
+		ClientID:     clientId,
+		ClientSecret: clientSecret,
+		Scopes:       scopes,
+		AuthStyle:    oauth2.AuthStyleInParams,
+		TokenURL:     identityEndpoint + "/oauth/token",
+	}
+
+	return config.TokenSource(context)
 }
 
 // DebugFlag represents a set of debug bit flags that can be bitwise-ORed
@@ -468,8 +542,8 @@ func (c *Client) post(ctx context.Context, path string, payload interface{}, hea
 	return c.do(ctx, http.MethodPost, path, bytes.NewBuffer(data), headers)
 }
 
-func (c *Client) get(ctx context.Context, path string) (*http.Response, error) {
-	return c.do(ctx, http.MethodGet, path, nil, nil)
+func (c *Client) get(ctx context.Context, path string, headers map[string]string) (*http.Response, error) {
+	return c.do(ctx, http.MethodGet, path, nil, headers)
 }
 
 const (
@@ -478,7 +552,7 @@ const (
 	contentTypeHeader = "application/json"
 )
 
-func (c *Client) prepRequest(req *http.Request, authRequired bool, headers map[string]string) {
+func (c *Client) prepRequest(req *http.Request, authRequired bool, headers map[string]string) error {
 	req.Header.Set("Accept", acceptHeader)
 
 	for k, v := range headers {
@@ -489,37 +563,103 @@ func (c *Client) prepRequest(req *http.Request, authRequired bool, headers map[s
 		switch c.authType {
 		case oauthToken:
 			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		case scopedOAuthAppToken:
+			token, err := c.tokenSource.Token()
+			if err != nil {
+				return fmt.Errorf("failed to prep request: %w", err)
+			}
+			token.SetAuthHeader(req)
 		default:
 			req.Header.Set("Authorization", "Token token="+c.authToken)
 		}
 	}
 
-	req.Header.Set("User-Agent", userAgentHeader)
+	var userAgent string
+	if c.userAgent != "" {
+		userAgent = c.userAgent
+	} else {
+		userAgent = userAgentHeader
+	}
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Content-Type", contentTypeHeader)
+
+	return nil
 }
 
 func dupeRequest(r *http.Request) (*http.Request, error) {
 	dreq := r.Clone(r.Context())
 
 	if r.Body != nil {
-		data, err := ioutil.ReadAll(r.Body)
+		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to copy request body: %w", err)
 		}
 
 		_ = r.Body.Close()
 
-		r.Body = ioutil.NopCloser(bytes.NewReader(data))
-		dreq.Body = ioutil.NopCloser(bytes.NewReader(data))
+		r.Body = io.NopCloser(bytes.NewReader(data))
+		dreq.Body = io.NopCloser(bytes.NewReader(data))
 	}
 
 	return dreq, nil
 }
 
 // needed where pagerduty use a different endpoint for certain actions (eg: v2 events)
-func (c *Client) doWithEndpoint(ctx context.Context, endpoint, method, path string, authRequired bool, body io.Reader, headers map[string]string) (*http.Response, error) {
-	var dreq *http.Request
+func (c *Client) doWithEndpoint(
+	ctx context.Context,
+	endpoint,
+	method,
+	path string,
+	authRequired bool,
+	body io.Reader,
+	headers map[string]string,
+) (*http.Response, error) {
 	var resp *http.Response
+	var respErr error
+
+	// Attempt with optional retries
+	for attempt := 0; ; attempt++ {
+		// Build a new request for each atempt.
+		req, err := http.NewRequestWithContext(ctx, method, endpoint+path, body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build request: %w", err)
+		}
+
+		resp, respErr = c.doSingleRequest(req, authRequired, headers)
+
+		// Handle retry if applicable
+		shouldRetry, delay := c.shouldRetry(resp, respErr, attempt)
+		if !shouldRetry {
+			break
+		}
+
+		select {
+		case <-time.After(delay):
+			continue
+		case <-ctx.Done():
+			err = fmt.Errorf("context completed during retry: %w", ctx.Err())
+			return nil, err
+		}
+	}
+
+	// Handle final results
+	if respErr != nil {
+		return nil, respErr
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return resp, c.getErrorFromResponse(resp)
+	}
+
+	return resp, nil
+}
+
+func (c *Client) doSingleRequest(
+	req *http.Request,
+	authRequired bool,
+	headers map[string]string,
+) (resp *http.Response, err error) {
+	var dreq *http.Request
 
 	// so that the last request and response can be nil if there was an error
 	// before the request could be fully processed by the origin, we defer these
@@ -536,12 +676,9 @@ func (c *Client) doWithEndpoint(ctx context.Context, endpoint, method, path stri
 		}()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, endpoint+path, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %w", err)
+	if err := c.prepRequest(req, authRequired, headers); err != nil {
+		return nil, err
 	}
-
-	c.prepRequest(req, authRequired, headers)
 
 	// if in debug mode, copy request before making it
 	if c.debugCaptureRequest() {
@@ -551,8 +688,44 @@ func (c *Client) doWithEndpoint(ctx context.Context, endpoint, method, path stri
 	}
 
 	resp, err = c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error calling the API endpoint: %v", err)
+	}
 
-	return c.checkResponse(resp, err)
+	return resp, nil
+}
+
+// shouldRetry reports whether a request should be retried, and if so, how long to wait before retrying.
+func (c *Client) shouldRetry(resp *http.Response, err error, attempt int) (shouldRetry bool, delay time.Duration) {
+	if attempt >= c.retryPolicy.MaxRetries {
+		return false, 0
+	}
+
+	// For now we only retry on a few known error conditions such as the network errors,
+	// 5xx responses, and rate limiting.
+	if err != nil || resp.StatusCode >= 500 {
+		return true, calculateRetryDelay(attempt, c.retryPolicy)
+	} else if resp.StatusCode == http.StatusTooManyRequests {
+		// The REST API rate limits usually return an indication of how long to wait before retrying
+		resetStr := resp.Header.Get("ratelimit-reset")
+		if delaySeconds, err := strconv.Atoi(resetStr); err == nil {
+			return true, time.Duration(delaySeconds) * time.Second
+		}
+		// otherwise use the default retry delay
+		return true, calculateRetryDelay(attempt, c.retryPolicy)
+	} else {
+		return false, 0
+	}
+}
+
+// calculateRetryDelay uses a binary exponential backoff with jitter algorithm
+func calculateRetryDelay(attempt int, retryPolicy retryPolicy) time.Duration {
+	delay := time.Duration(math.Exp2(float64(attempt))) * time.Second
+	if delay > retryPolicy.MaxDelay {
+		delay = retryPolicy.MaxDelay
+	}
+
+	return delay
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, headers map[string]string) (*http.Response, error) {
@@ -565,28 +738,16 @@ func (c *Client) decodeJSON(resp *http.Response, payload interface{}) error {
 	orb := resp.Body
 	defer func() { _ = orb.Close() }() // explicitly discard error
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	if c.debugCaptureResponse() { // reset body as we capture the response elsewhere
-		resp.Body = ioutil.NopCloser(bytes.NewReader(body))
+		resp.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
 	return json.Unmarshal(body, payload)
-}
-
-func (c *Client) checkResponse(resp *http.Response, err error) (*http.Response, error) {
-	if err != nil {
-		return resp, fmt.Errorf("error calling the API endpoint: %v", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return resp, c.getErrorFromResponse(resp)
-	}
-
-	return resp, nil
 }
 
 func (c *Client) getErrorFromResponse(resp *http.Response) APIError {

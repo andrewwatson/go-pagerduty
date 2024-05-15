@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -47,6 +48,7 @@ func defaultTestClient(serverURL, authToken string) *Client {
 		debugFlag:           new(uint64),
 		lastRequest:         &atomic.Value{},
 		lastResponse:        &atomic.Value{},
+		retryPolicy:         defaultRetryPolicy,
 	}
 }
 
@@ -135,6 +137,11 @@ func TestAPIError_Error(t *testing.T) {
 				name:  "three_error",
 				input: `{"error":{"code": 420, "message": "Enhance Your Calm", "errors":["No Seriously, Enhance Your Calm", "Slow Your Roll", "No, really..."]}}`,
 				want:  "HTTP response failed with status code 429, message: Enhance Your Calm (code: 420): No Seriously, Enhance Your Calm (and 2 more errors...)",
+			},
+			{
+				name:  "issue_478",
+				input: `{"error":["links should have at most 50 item(s)"]}`,
+				want:  "HTTP response failed with status code 429, message: none (code: 0): links should have at most 50 item(s)",
 			},
 		}
 
@@ -679,6 +686,157 @@ func TestClient_Do(t *testing.T) {
 				t.Fatalf("body = %s, want ok", bs)
 			}
 		})
+	}
+}
+
+func TestClient_RetriesHandleRequestBodies(t *testing.T) {
+	setup()
+	defer teardown()
+
+	attempt := 1
+
+	mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, err := io.Copy(io.Discard, r.Body)
+
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"empty":"object"}`))
+			attempt++
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"empty":"object"}`))
+		}
+	})
+
+	client := NewClient("foo",
+		WithAPIEndpoint(server.URL),
+		WithRetryPolicy(2, 1),
+	)
+
+	_, err := client.do(context.Background(), "POST", "/test", strings.NewReader("some data\n"), nil)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if attempt < 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempt)
+	}
+}
+
+func TestClient_RetriesOnVariousConditions(t *testing.T) {
+	tests := []struct {
+		name             string
+		status           int
+		expectedAttempts int
+	}{
+		{
+			name:             "rate_limited",
+			status:           http.StatusTooManyRequests,
+			expectedAttempts: 3,
+		},
+		{
+			name:             "server_error",
+			status:           http.StatusInternalServerError,
+			expectedAttempts: 3,
+		},
+		{
+			name:             "bad_request",
+			status:           http.StatusBadRequest,
+			expectedAttempts: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setup()
+			defer teardown()
+
+			c := NewClient("foo",
+				WithAPIEndpoint(server.URL),
+				WithRetryPolicy(2, 1),
+			)
+
+			attempt := 0
+
+			mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+				attempt++
+				defer r.Body.Close()
+				_, err := io.Copy(io.Discard, r.Body)
+
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				w.Write([]byte(`{"empty":"object"}`))
+			})
+
+			resp, err := c.do(context.Background(), "GET", "/test", nil, nil)
+			testErrCheck(t, "client.do()", "response failed with status code", err)
+
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+
+			if attempt != tt.expectedAttempts {
+				t.Fatalf("expected %d attempts, got %d", tt.expectedAttempts, attempt)
+			}
+		})
+	}
+}
+
+func TestClient_UserAgentDefault(t *testing.T) {
+	setup()
+	defer teardown()
+
+	defaultUserAgent := userAgentHeader
+	mux.HandleFunc("/foo", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "GET")
+		userAgentHeader := r.Header.Get("User-Agent")
+		if userAgentHeader != defaultUserAgent {
+			t.Fatalf("want %q, but got %q", defaultUserAgent, userAgentHeader)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	client := defaultTestClient(server.URL, "foo")
+
+	_, err := client.do(context.Background(), "GET", "/foo", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClient_UserAgentOverwrite(t *testing.T) {
+	setup()
+	defer teardown()
+
+	terraformVersion := "terraform-version-for-testing"
+	newUserAgent := fmt.Sprintf("(%s %s) Terraform/%s", runtime.GOOS, runtime.GOARCH, terraformVersion)
+	mux.HandleFunc("/foo", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "GET")
+		userAgentHeader := r.Header.Get("User-Agent")
+		if userAgentHeader != newUserAgent {
+			t.Fatalf("want %q, but got %q", newUserAgent, userAgentHeader)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	client := NewClient("foo",
+		WithAPIEndpoint(server.URL),
+		WithTerraformProvider(terraformVersion),
+	)
+
+	_, err := client.do(context.Background(), "GET", "/foo", nil, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
