@@ -3,6 +3,7 @@ module github.com/andrewwatson/go-pagerduty
 go 1.19
 
 require (
+	github.com/PagerDuty/go-pagerduty v1.8.0
 	github.com/google/go-cmp v0.6.0
 	github.com/google/go-querystring v1.1.0
 	github.com/mitchellh/cli v1.1.5
