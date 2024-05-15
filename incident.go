@@ -669,18 +669,18 @@ type ResponderRequestTargetWrapper struct {
 
 // ResponderRequestOptions defines the input options for the Create Responder function.
 type ResponderRequestOptions struct {
-	From        string                   `json:"-"`
-	Message     string                   `json:"message"`
-	RequesterID string                   `json:"requester_id"`
+	From        string                          `json:"-"`
+	Message     string                          `json:"message"`
+	RequesterID string                          `json:"requester_id"`
 	Targets     []ResponderRequestTargetWrapper `json:"responder_request_targets"`
 }
 
 // ResponderRequest contains the API structure for an incident responder request.
 type ResponderRequest struct {
-	Incident    Incident                 `json:"incident"`
-	Requester   User                     `json:"requester,omitempty"`
-	RequestedAt string                   `json:"request_at,omitempty"`
-	Message     string                   `json:"message,omitempty"`
+	Incident    Incident                        `json:"incident"`
+	Requester   User                            `json:"requester,omitempty"`
+	RequestedAt string                          `json:"request_at,omitempty"`
+	Message     string                          `json:"message,omitempty"`
 	Targets     []ResponderRequestTargetWrapper `json:"responder_request_targets"`
 }
 
